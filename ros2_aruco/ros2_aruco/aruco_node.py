@@ -34,11 +34,13 @@ from cv_bridge import CvBridge
 import numpy as np
 import cv2
 import tf_transformations
+import tf2_ros
 from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import PoseArray, Pose
 from ros2_aruco_interfaces.msg import ArucoMarkers
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
+from geometry_msgs.msg import TransformStamped
 
 
 class ArucoNode(rclpy.node.Node):
@@ -140,6 +142,11 @@ class ArucoNode(rclpy.node.Node):
         self.poses_pub = self.create_publisher(PoseArray, "aruco_poses", 10)
         self.markers_pub = self.create_publisher(ArucoMarkers, "aruco_markers", 10)
 
+        # Set up tf broadcaster
+        self.tf2buffer = tf2_ros.Buffer()
+        self.listener = tf2_ros.TransformListener(self.tf2buffer, self)
+        self.broadcaster = tf2_ros.TransformBroadcaster(self)
+
         # Set up fields for camera parameters
         self.info_msg = None
         self.intrinsic_mat = None
@@ -178,22 +185,30 @@ class ArucoNode(rclpy.node.Node):
         corners, marker_ids, rejected = self.aruco_detector.detectMarkers(cv_image)
 
         if marker_ids is not None:
-            if cv2.__version__ > "4.0.0":
-                rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-                    corners, self.marker_size, self.intrinsic_mat, self.distortion
-                )
-            else:
-                rvecs, tvecs = cv2.aruco.estimatePoseSingleMarkers(
-                    corners, self.marker_size, self.intrinsic_mat, self.distortion
-                )
+            half = self.marker_size / 2.0
+            object_points = np.array([
+                [-half,  half, 0],
+                [ half,  half, 0],
+                [ half, -half, 0],
+                [-half, -half, 0]
+            ], dtype=np.float32)
+            
             for i, marker_id in enumerate(marker_ids):
+                image_points = corners[i][0]
+                ok, rvec, tvec = cv2.solvePnP(
+                object_points, image_points,
+                self.intrinsic_mat, self.distortion
+                )
+                if not ok:
+                    continue
+
                 pose = Pose()
-                pose.position.x = tvecs[i][0][0]
-                pose.position.y = tvecs[i][0][1]
-                pose.position.z = tvecs[i][0][2]
+                pose.position.x = tvec[0][0]
+                pose.position.y = tvec[1][0]
+                pose.position.z = tvec[2][0]
 
                 rot_matrix = np.eye(4)
-                rot_matrix[0:3, 0:3] = cv2.Rodrigues(np.array(rvecs[i][0]))[0]
+                rot_matrix[0:3, 0:3] = cv2.Rodrigues(rvec)[0]
                 quat = tf_transformations.quaternion_from_matrix(rot_matrix)
 
                 pose.orientation.x = quat[0]
@@ -204,6 +219,24 @@ class ArucoNode(rclpy.node.Node):
                 pose_array.poses.append(pose)
                 markers.poses.append(pose)
                 markers.marker_ids.append(marker_id[0])
+
+                 # --- broadcast this marker's pose as a TF frame ---
+                t = TransformStamped()
+                t.header.stamp = img_msg.header.stamp   # detection time
+                t.header.frame_id = self.info_msg.header.frame_id  # the camera frame resolved above 
+                t.child_frame_id = f"ar_marker/{marker_id[0]}"
+
+                t.transform.translation.x = pose.position.x
+                t.transform.translation.y = pose.position.y
+                t.transform.translation.z = pose.position.z
+
+                t.transform.rotation.x = pose.orientation.x
+                t.transform.rotation.y = pose.orientation.y
+                t.transform.rotation.z = pose.orientation.z
+                t.transform.rotation.w = pose.orientation.w
+
+                self.broadcaster.sendTransform(t)
+
 
             self.poses_pub.publish(pose_array)
             self.markers_pub.publish(markers)
