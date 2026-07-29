@@ -29,7 +29,7 @@ Version: 10/26/2020
 
 import rclpy
 import rclpy.node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_parameters
 from cv_bridge import CvBridge
 import numpy as np
 import cv2
@@ -68,7 +68,7 @@ class ArucoNode(rclpy.node.Node):
 
         self.declare_parameter(
             name="image_topic",
-            value="//head_center_camera/image_raw",
+            value="/head_center_camera/image_raw",
             descriptor=ParameterDescriptor(
                 type=ParameterType.PARAMETER_STRING,
                 description="Image topic to subscribe to.",
@@ -131,11 +131,11 @@ class ArucoNode(rclpy.node.Node):
 
         # Set up subscriptions
         self.info_sub = self.create_subscription(
-            CameraInfo, info_topic, self.info_callback, qos_profile_sensor_data
+            CameraInfo, info_topic, self.info_callback, qos_profile_parameters
         )
 
         self.create_subscription(
-            Image, image_topic, self.image_callback, qos_profile_sensor_data
+            Image, image_topic, self.image_callback, 10
         )
 
         # Set up publishers
@@ -165,6 +165,11 @@ class ArucoNode(rclpy.node.Node):
         self.destroy_subscription(self.info_sub)
 
     def image_callback(self, img_msg):
+        timeout_cnt=0
+        while timeout_cnt < 600 and self.info_msg is None:
+            rclpy.spin_once(self, timeout_sec=0.1)
+            timeout_cnt+=1
+
         if self.info_msg is None:
             self.get_logger().warn("No camera info has been received!")
             return
