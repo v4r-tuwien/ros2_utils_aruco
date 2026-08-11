@@ -41,6 +41,7 @@ from geometry_msgs.msg import PoseArray, Pose
 from ros2_aruco_interfaces.msg import ArucoMarkers
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from geometry_msgs.msg import TransformStamped
+from collections import deque, defaultdict
 
 
 class ArucoNode(rclpy.node.Node):
@@ -157,6 +158,8 @@ class ArucoNode(rclpy.node.Node):
         self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dictionary, self.aruco_parameters)
         self.bridge = CvBridge()
 
+        self.averager = ArucoAverager(window_size=5)
+
     def info_callback(self, info_msg):
         self.info_msg = info_msg
         self.intrinsic_mat = np.reshape(np.array(self.info_msg.k), (3, 3))
@@ -164,16 +167,13 @@ class ArucoNode(rclpy.node.Node):
         # Assume that camera parameters will remain the same...
         self.destroy_subscription(self.info_sub)
 
-    def image_callback(self, img_msg):
-        timeout_cnt=0
-        while timeout_cnt < 600 and self.info_msg is None:
-            rclpy.spin_once(self, timeout_sec=0.1)
-            timeout_cnt+=1
-
+    
+    def image_callback(self, img_msg):  
+        
         if self.info_msg is None:
             self.get_logger().warn("No camera info has been received!")
             return
-
+        
         cv_image = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="mono8")
         markers = ArucoMarkers()
         pose_array = PoseArray()
@@ -189,7 +189,9 @@ class ArucoNode(rclpy.node.Node):
 
         corners, marker_ids, rejected = self.aruco_detector.detectMarkers(cv_image)
 
+        
         if marker_ids is not None:
+            self.get_logger().info(f"found aruco marker with {marker_ids[0]}")
             half = self.marker_size / 2.0
             object_points = np.array([
                 [-half,  half, 0],
@@ -206,30 +208,28 @@ class ArucoNode(rclpy.node.Node):
                 )
                 if not ok:
                     continue
-
+                
                 pose = Pose()
-                pose.position.x = tvec[0][0]
-                pose.position.y = tvec[1][0]
-                pose.position.z = tvec[2][0]
-
                 rot_matrix = np.eye(4)
                 rot_matrix[0:3, 0:3] = cv2.Rodrigues(rvec)[0]
                 quat = tf_transformations.quaternion_from_matrix(rot_matrix)
 
-                pose.orientation.x = quat[0]
-                pose.orientation.y = quat[1]
-                pose.orientation.z = quat[2]
-                pose.orientation.w = quat[3]
+                avg_pos, avg_quat = self.averager.add_and_average(marker_id[0], tvec, quat)
+
+                pose.position.x, pose.position.y, pose.position.z = avg_pos
+                pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = avg_quat
 
                 pose_array.poses.append(pose)
                 markers.poses.append(pose)
                 markers.marker_ids.append(marker_id[0])
 
+                
+
                  # --- broadcast this marker's pose as a TF frame ---
                 t = TransformStamped()
                 t.header.stamp = img_msg.header.stamp   # detection time
                 t.header.frame_id = self.info_msg.header.frame_id  # the camera frame resolved above 
-                t.child_frame_id = f"ar_marker/{marker_id[0]}"
+                t.child_frame_id = f"aruco_marker/{marker_id[0]}"
 
                 t.transform.translation.x = pose.position.x
                 t.transform.translation.y = pose.position.y
@@ -246,6 +246,39 @@ class ArucoNode(rclpy.node.Node):
             self.poses_pub.publish(pose_array)
             self.markers_pub.publish(markers)
 
+class ArucoAverager:
+    def __init__(self, window_size=5):
+        self.window_size = window_size
+        self.buffers = defaultdict(lambda: deque(maxlen=window_size))
+
+    def add_and_average(self, marker_id, tvec, quat):
+        buf = self.buffers[marker_id]
+        buf.append((tvec.flatten(), quat))
+
+        positions = np.array([p for p, q in buf])
+        avg_pos = positions.mean(axis=0)
+
+        quats = np.array([q for p, q in buf])
+        avg_quat = self._average_quaternions(quats)
+
+        return avg_pos, avg_quat
+
+    def _average_quaternions(self, quats):
+        # Flip sign so all quats are in the same hemisphere as the first one
+        ref = quats[0]
+        for i in range(len(quats)):
+            if np.dot(quats[i], ref) < 0:
+                quats[i] = -quats[i]
+
+        # Markley's method: eigenvector of largest eigenvalue of sum(q q^T)
+        A = np.zeros((4, 4))
+        for q in quats:
+            A += np.outer(q, q)
+        A /= len(quats)
+
+        eigvals, eigvecs = np.linalg.eigh(A)
+        avg_quat = eigvecs[:, np.argmax(eigvals)]
+        return avg_quat / np.linalg.norm(avg_quat)
 
 def main():
     rclpy.init()
@@ -258,3 +291,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
